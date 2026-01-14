@@ -10,8 +10,9 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp import Context
 
-# 配置常量
-DATABASE_PATH = "jcr.db"
+# 配置常量 - 使用脚本所在目录的绝对路径
+SCRIPT_DIR = Path(__file__).parent.absolute()
+DATABASE_PATH = str(SCRIPT_DIR / "jcr.db")
 DATA_UPDATE_URL = "https://raw.githubusercontent.com/hitfyd/ShowJCR/master/中科院分区表及JCR原始数据文件/"
 
 @dataclass
@@ -94,26 +95,36 @@ class JCRDatabase:
             ccf_level = None
             year = None
             
+            # 辅助函数：查找包含关键字的列
+            def find_column_value(keywords):
+                for key, value in row_dict.items():
+                    for keyword in keywords:
+                        if keyword.lower() in key.lower():
+                            return value
+                return None
+            
             # 解析年份
-            if 'JCR' in table_name:
+            if 'JCR' in table_name and 'FQBJCR' not in table_name:
                 year = table_name.replace('JCR', '')
-                impact_factor = row_dict.get('IF', row_dict.get('Impact Factor'))
-                partition = row_dict.get('Quartile', row_dict.get('分区'))
-                category = row_dict.get('Category', row_dict.get('类别'))
+                # 动态查找 IF 和 Quartile 列（列名可能是 IF(2022)、IF Quartile(2022) 等格式）
+                impact_factor = find_column_value(['IF(', 'IF '])
+                partition = find_column_value(['Quartile', '分区'])
+                category = find_column_value(['Category', '类别', 'SCIE', 'SSCI'])
             
             elif 'FQBJCR' in table_name:
                 year = table_name.replace('FQBJCR', '')
-                partition = row_dict.get('大类分区', row_dict.get('Partition'))
-                category = row_dict.get('学科', row_dict.get('Subject'))
+                partition = find_column_value(['大类分区', '分区', 'Partition'])
+                category = find_column_value(['学科', 'Subject', '大类'])
+                impact_factor = find_column_value(['IF', '影响因子'])
             
             elif 'GJQKYJMD' in table_name:
                 year = table_name.replace('GJQKYJMD', '')
-                warning_status = row_dict.get('预警等级', row_dict.get('Warning Level'))
+                warning_status = find_column_value(['预警等级', '预警原因', 'Warning'])
             
             elif 'CCF' in table_name:
                 year = table_name.replace('CCF', '')
-                ccf_level = row_dict.get('CCF推荐类型', row_dict.get('CCF Level'))
-                category = row_dict.get('领域', row_dict.get('Field'))
+                ccf_level = find_column_value(['CCF推荐类型', 'CCF', '等级'])
+                category = find_column_value(['领域', 'Field'])
             
             return JournalInfo(
                 journal_name=journal_name,
