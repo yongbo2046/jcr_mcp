@@ -388,6 +388,402 @@ async def compare_journals(journal_list: str) -> str:
     except Exception as e:
         return f"比较分析出错: {str(e)}"
 
+@app.tool()
+async def filter_journals(
+    partition: Optional[str] = None,
+    min_if: Optional[float] = None,
+    max_if: Optional[float] = None,
+    category: Optional[str] = None,
+    is_top: Optional[bool] = None,
+    is_oa: Optional[bool] = None,
+    year: str = "2025",
+    limit: int = 50
+) -> str:
+    """
+    按条件筛选期刊列表
+
+    Args:
+        partition: 分区筛选，如"1区"、"2区"、"Q1"、"Q2"等
+        min_if: 最小影响因子
+        max_if: 最大影响因子
+        category: 学科大类，如"计算机科学"、"医学"、"化学"等
+        is_top: 是否Top期刊（仅对中科院分区有效）
+        is_oa: 是否开放获取期刊
+        year: 数据年份，默认2025
+        limit: 返回结果数量限制，默认50
+
+    Returns:
+        符合条件的期刊列表
+    """
+    try:
+        conn = sqlite3.connect(db.db_path)
+        cursor = conn.cursor()
+
+        # 优先使用中科院分区表（FQBJCR）
+        table_name = f"FQBJCR{year}"
+
+        # 检查表是否存在
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+        if not cursor.fetchone():
+            # 尝试使用JCR表
+            table_name = f"JCR{year}"
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+            if not cursor.fetchone():
+                conn.close()
+                return f"未找到{year}年的期刊数据表"
+
+        # 获取表结构
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = [col[1] for col in cursor.fetchall()]
+
+        # 构建查询条件
+        conditions = []
+        params = []
+
+        # 分区筛选
+        if partition:
+            if '大类分区' in columns:
+                conditions.append("大类分区 LIKE ?")
+                params.append(f"%{partition}%")
+            elif any('Quartile' in col for col in columns):
+                quartile_col = [col for col in columns if 'Quartile' in col][0]
+                conditions.append(f'"{quartile_col}" LIKE ?')
+                params.append(f"%{partition}%")
+
+        # 学科筛选
+        if category:
+            if '大类' in columns:
+                conditions.append("大类 LIKE ?")
+                params.append(f"%{category}%")
+            elif 'Category' in columns:
+                conditions.append("Category LIKE ?")
+                params.append(f"%{category}%")
+
+        # Top期刊筛选
+        if is_top is not None and 'Top' in columns:
+            if is_top:
+                conditions.append("Top = '是'")
+            else:
+                conditions.append("(Top = '否' OR Top IS NULL)")
+
+        # OA筛选
+        if is_oa is not None and 'Open Access' in columns:
+            if is_oa:
+                conditions.append('"Open Access" IS NOT NULL AND "Open Access" != \'\'')
+            else:
+                conditions.append('("Open Access" IS NULL OR "Open Access" = \'\')')
+
+        # 构建SQL
+        query = f"SELECT * FROM {table_name}"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += f" LIMIT {limit}"
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        column_names = [desc[0] for desc in cursor.description]
+
+        if not rows:
+            conn.close()
+            return "未找到符合条件的期刊"
+
+        # 影响因子筛选（后处理，因为列名动态）
+        results = []
+        for row in rows:
+            row_dict = dict(zip(column_names, row))
+
+            # 查找影响因子
+            if_value = None
+            for key, value in row_dict.items():
+                if 'IF' in key and value is not None:
+                    try:
+                        if_value = float(value)
+                        break
+                    except (ValueError, TypeError):
+                        continue
+
+            # 影响因子范围筛选
+            if min_if is not None and (if_value is None or if_value < min_if):
+                continue
+            if max_if is not None and (if_value is None or if_value > max_if):
+                continue
+
+            results.append(row_dict)
+
+        conn.close()
+
+        if not results:
+            return "未找到符合条件的期刊"
+
+        # 格式化输出
+        output = [f"🔍 筛选结果（{year}年数据，共{len(results)}条）"]
+        output.append("=" * 50)
+
+        for i, row in enumerate(results[:limit], 1):
+            journal = row.get('Journal', '未知')
+            partition_val = row.get('大类分区', row.get([k for k in row.keys() if 'Quartile' in k][0] if any('Quartile' in k for k in row.keys()) else '', ''))
+            category_val = row.get('大类', row.get('Category', ''))
+            top_val = row.get('Top', '')
+
+            # 查找IF
+            if_val = ''
+            for key, value in row.items():
+                if 'IF' in key and value:
+                    if_val = str(value)
+                    break
+
+            output.append(f"\n{i}. {journal}")
+            if partition_val:
+                output.append(f"   分区: {partition_val}")
+            if if_val:
+                output.append(f"   IF: {if_val}")
+            if category_val:
+                output.append(f"   学科: {category_val}")
+            if top_val == '是':
+                output.append(f"   ⭐ Top期刊")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        return f"筛选出错: {str(e)}"
+
+
+@app.tool()
+async def batch_query_journals(journal_names: str, output_format: str = "text") -> str:
+    """
+    批量查询多个期刊信息，支持导出为JSON格式
+
+    Args:
+        journal_names: 期刊名称列表，用逗号或换行分隔
+        output_format: 输出格式，"text"为文本格式，"json"为JSON格式（方便导出）
+
+    Returns:
+        批量查询结果
+    """
+    try:
+        # 解析期刊名称列表
+        names = []
+        for name in journal_names.replace('\n', ',').split(','):
+            name = name.strip()
+            if name:
+                names.append(name)
+
+        if not names:
+            return "请提供至少一个期刊名称"
+
+        results_data = []
+
+        for name in names:
+            journal_results = db.search_journal(name)
+
+            if journal_results:
+                # 获取最新数据
+                latest_info = {
+                    "query": name,
+                    "found": True,
+                    "journal_name": journal_results[0].journal_name,
+                    "impact_factor": None,
+                    "partition": None,
+                    "category": None,
+                    "warning": False,
+                    "years_data": []
+                }
+
+                for r in journal_results:
+                    year_data = {"year": r.year}
+                    if r.impact_factor:
+                        year_data["if"] = r.impact_factor
+                        if latest_info["impact_factor"] is None:
+                            latest_info["impact_factor"] = r.impact_factor
+                    if r.partition:
+                        year_data["partition"] = r.partition
+                        if latest_info["partition"] is None:
+                            latest_info["partition"] = r.partition
+                    if r.category:
+                        year_data["category"] = r.category
+                        if latest_info["category"] is None:
+                            latest_info["category"] = r.category
+                    if r.warning_status:
+                        year_data["warning"] = r.warning_status
+                        latest_info["warning"] = True
+
+                    latest_info["years_data"].append(year_data)
+
+                results_data.append(latest_info)
+            else:
+                results_data.append({
+                    "query": name,
+                    "found": False
+                })
+
+        # 输出格式
+        if output_format.lower() == "json":
+            return json.dumps(results_data, ensure_ascii=False, indent=2)
+
+        # 文本格式输出
+        output = [f"📋 批量查询结果（共{len(names)}个期刊）"]
+        output.append("=" * 50)
+
+        for data in results_data:
+            if data["found"]:
+                output.append(f"\n✅ {data['journal_name']}")
+                if data["impact_factor"]:
+                    output.append(f"   IF: {data['impact_factor']}")
+                if data["partition"]:
+                    output.append(f"   分区: {data['partition']}")
+                if data["category"]:
+                    output.append(f"   学科: {data['category']}")
+                if data["warning"]:
+                    output.append(f"   ⚠️ 存在预警记录")
+            else:
+                output.append(f"\n❌ {data['query']} - 未找到")
+
+        output.append("\n" + "=" * 50)
+        output.append("💡 提示: 使用 output_format='json' 可获取JSON格式，方便导出到Excel")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        return f"批量查询出错: {str(e)}"
+
+
+@app.tool()
+async def check_data_update() -> str:
+    """
+    检查ShowJCR数据源是否有更新
+
+    Returns:
+        数据源更新状态信息
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # 检查远程数据库文件
+            db_url = "https://raw.githubusercontent.com/hitfyd/ShowJCR/master/中科院分区表及JCR原始数据文件/jcr.db"
+
+            response = await client.head(db_url, follow_redirects=True)
+
+            if response.status_code == 200:
+                remote_size = int(response.headers.get('content-length', 0))
+                remote_modified = response.headers.get('last-modified', '未知')
+
+                # 获取本地文件信息
+                local_size = 0
+                local_modified = "未知"
+                if os.path.exists(DATABASE_PATH):
+                    local_size = os.path.getsize(DATABASE_PATH)
+                    local_modified = os.path.getmtime(DATABASE_PATH)
+                    from datetime import datetime
+                    local_modified = datetime.fromtimestamp(local_modified).strftime('%Y-%m-%d %H:%M:%S')
+
+                output = ["🔄 数据更新检查"]
+                output.append("=" * 40)
+                output.append(f"\n📡 远程数据源:")
+                output.append(f"   大小: {remote_size / 1024 / 1024:.2f} MB")
+                output.append(f"   更新时间: {remote_modified}")
+                output.append(f"\n💾 本地数据库:")
+                output.append(f"   大小: {local_size / 1024 / 1024:.2f} MB")
+                output.append(f"   更新时间: {local_modified}")
+
+                if remote_size != local_size:
+                    output.append(f"\n⚠️ 检测到数据可能有更新！")
+                    output.append(f"💡 使用 sync_database 工具下载最新数据")
+                else:
+                    output.append(f"\n✅ 本地数据已是最新")
+
+                return "\n".join(output)
+            else:
+                return f"无法连接数据源，状态码: {response.status_code}"
+
+    except Exception as e:
+        return f"检查更新出错: {str(e)}"
+
+
+@app.tool()
+async def sync_database() -> str:
+    """
+    从ShowJCR下载最新数据库文件
+
+    Returns:
+        同步结果
+    """
+    try:
+        db_url = "https://raw.githubusercontent.com/hitfyd/ShowJCR/master/中科院分区表及JCR原始数据文件/jcr.db"
+
+        output = ["🔄 开始同步数据库..."]
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.get(db_url, follow_redirects=True)
+
+            if response.status_code == 200:
+                # 备份旧数据库
+                backup_path = DATABASE_PATH + ".backup"
+                if os.path.exists(DATABASE_PATH):
+                    import shutil
+                    shutil.copy2(DATABASE_PATH, backup_path)
+                    output.append("📦 已备份旧数据库")
+
+                # 写入新数据库
+                with open(DATABASE_PATH, 'wb') as f:
+                    f.write(response.content)
+
+                new_size = len(response.content) / 1024 / 1024
+                output.append(f"✅ 下载完成，大小: {new_size:.2f} MB")
+
+                # 验证数据库
+                conn = sqlite3.connect(DATABASE_PATH)
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = cursor.fetchall()
+                conn.close()
+
+                output.append(f"📊 数据表数量: {len(tables)}")
+                output.append("\n✅ 数据库同步成功！")
+
+                return "\n".join(output)
+            else:
+                return f"下载失败，状态码: {response.status_code}"
+
+    except Exception as e:
+        return f"同步出错: {str(e)}"
+
+
+@app.tool()
+async def get_available_categories(year: str = "2025") -> str:
+    """
+    获取可用的学科分类列表
+
+    Args:
+        year: 数据年份，默认2025
+
+    Returns:
+        可用的学科大类列表
+    """
+    try:
+        conn = sqlite3.connect(db.db_path)
+        cursor = conn.cursor()
+
+        table_name = f"FQBJCR{year}"
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+
+        if not cursor.fetchone():
+            conn.close()
+            return f"未找到{year}年的数据"
+
+        cursor.execute(f"SELECT DISTINCT 大类 FROM {table_name} WHERE 大类 IS NOT NULL ORDER BY 大类")
+        categories = [row[0] for row in cursor.fetchall()]
+        conn.close()
+
+        output = [f"📚 可用学科分类（{year}年）"]
+        output.append("=" * 30)
+        for i, cat in enumerate(categories, 1):
+            output.append(f"{i}. {cat}")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        return f"获取分类出错: {str(e)}"
+
+
 @app.resource("jcr://database-info")
 async def get_database_info() -> str:
     """获取数据库基本信息"""
@@ -439,8 +835,13 @@ if __name__ == "__main__":
     print("  • get_partition_trends - 获取分区趋势")
     print("  • check_warning_journals - 查询预警期刊")
     print("  • compare_journals - 对比期刊")
+    print("  • filter_journals - 按条件筛选期刊 [新增]")
+    print("  • batch_query_journals - 批量查询导出 [新增]")
+    print("  • check_data_update - 检查数据更新 [新增]")
+    print("  • sync_database - 同步最新数据 [新增]")
+    print("  • get_available_categories - 获取学科分类 [新增]")
     print("💡 提示词模板: journal_analysis_prompt")
     print("📋 资源: jcr://database-info")
     print("\n⚡ 服务器启动中...")
-    
+
     app.run(transport="stdio") 
